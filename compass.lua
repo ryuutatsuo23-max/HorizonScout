@@ -72,7 +72,7 @@ function compass.draw(config, radar_entities, radar_range)
     local heading_offset = tonumber(config.compass_heading_offset_degrees) or -90;
     heading = (heading + heading_offset * pi / 180) % two_pi;
 
-    local diameter = math.max(80, math.min(180, tonumber(config.compass_size) or 112));
+    local diameter = math.max(80, math.min(240, tonumber(config.compass_size) or 112));
     local window_width = diameter + 16;
     local window_height = diameter + 16;
     if force_position then

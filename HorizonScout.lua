@@ -1,12 +1,13 @@
 addon.name = 'HorizonScout';
-addon.author = 'Horizon Assist contributors';
-addon.version = '0.10.2';
-addon.desc = 'Nearby alerts, object-aware compass radar, map position, and explicit user targeting.';
+addon.author = 'DragoHorse';
+addon.version = '0.12.1';
+addon.desc = 'Nearby alerts, aggression warnings, compass radar, map position, and targeting.';
 addon.link = '';
 
 require('common');
 
 local chat = require('chat');
+local aggro_database = require('aggro_database');
 local compass = require('compass');
 local fonts = require('fonts');
 local imgui = require('imgui');
@@ -19,6 +20,11 @@ local maximum_entity_index = 0x08FF;
 local scan_interval_seconds = 0.50;
 local minimum_range = 1;
 local maximum_range = 50;
+local minimum_aggressive_alert_range = 1;
+local maximum_aggressive_alert_range = 50;
+local maximum_aggressive_sound_cooldown_seconds = 60;
+local maximum_compass_size = 240;
+local chocobo_server_status = 85;
 local visible_render_flag = 0x0200;
 local hidden_render_flag = 0x4000;
 local monster_spawn_flag = 0x0010;
@@ -28,6 +34,7 @@ local environment_spawn_flag = 0x0020;
 local monster_sound_path = addon.path .. '\\mobalert.wav';
 local npc_sound_path = addon.path .. '\\npcalert.wav';
 local interactable_sound_path = addon.path .. '\\interactablealert.wav';
+local aggressive_sound_path = addon.path .. '\\aggressivealert.wav';
 
 local default_settings = T{
     enabled = true,
@@ -36,6 +43,12 @@ local default_settings = T{
     sound_enabled = true,
     npc_sound_enabled = true,
     interactable_sound_enabled = true,
+    aggressive_sound_enabled = true,
+    aggressive_alert_range = 18,
+    aggressive_sound_cooldown_seconds = 10,
+    aggressive_suppress_on_chocobo = true,
+    aggressive_level_filter_enabled = true,
+    aggressive_level_gap = 15,
     sound_volume_percent = 100,
     chat_notifications_enabled = false,
     compass_enabled = true,
@@ -73,6 +86,11 @@ local state = T{
     npc_watch_lookup = T{},
     interactable_watch_lookup = T{},
     active_ids = T{},
+    aggressive_active_ids = T{},
+    aggressive_nearby_count = 0,
+    last_aggressive_sound_at = nil,
+    aggressive_suppressed_on_chocobo = false,
+    player_main_job_level = 0,
     matches = T{},
     radar_entities = T{},
     map_position = '?-?',
@@ -92,6 +110,15 @@ local settings_ui = T{
 
 local function tick_seconds()
     return ashita.time.tick64() / 1000;
+end
+
+local function aggressive_sound_cooldown_remaining(now)
+    if state.last_aggressive_sound_at == nil then
+        return 0;
+    end
+
+    local cooldown = state.settings.aggressive_sound_cooldown_seconds;
+    return math.max(0, cooldown - (now - state.last_aggressive_sound_at));
 end
 
 local function normalize_name(value)
@@ -188,6 +215,11 @@ end
 
 local function clear_observation_state()
     state.active_ids = T{};
+    state.aggressive_active_ids = T{};
+    state.aggressive_nearby_count = 0;
+    state.last_aggressive_sound_at = nil;
+    state.aggressive_suppressed_on_chocobo = false;
+    state.player_main_job_level = 0;
     state.matches = T{};
     state.radar_entities = T{};
 end
@@ -223,13 +255,43 @@ local function update_settings(new_settings)
     if state.settings.interactable_sound_enabled == nil then
         state.settings.interactable_sound_enabled = true;
     end
+    if state.settings.aggressive_sound_enabled == nil then
+        state.settings.aggressive_sound_enabled = true;
+    end
+    state.settings.aggressive_alert_range = math.max(
+        minimum_aggressive_alert_range,
+        math.min(
+            maximum_aggressive_alert_range,
+            tonumber(state.settings.aggressive_alert_range) or 18
+        )
+    );
+    state.settings.aggressive_sound_cooldown_seconds = math.max(
+        0,
+        math.min(
+            maximum_aggressive_sound_cooldown_seconds,
+            tonumber(state.settings.aggressive_sound_cooldown_seconds) or 10
+        )
+    );
+    if state.settings.aggressive_suppress_on_chocobo == nil then
+        state.settings.aggressive_suppress_on_chocobo = true;
+    end
+    if state.settings.aggressive_level_filter_enabled == nil then
+        state.settings.aggressive_level_filter_enabled = true;
+    end
+    state.settings.aggressive_level_gap = math.max(
+        1,
+        math.min(99, tonumber(state.settings.aggressive_level_gap) or 15)
+    );
     state.settings.sound_volume_percent = math.max(
         0,
         math.min(150, tonumber(state.settings.sound_volume_percent) or 100)
     );
     state.settings.compass_size = math.max(
         80,
-        math.min(180, tonumber(state.settings.compass_size) or scaling.scale_f(112))
+        math.min(
+            maximum_compass_size,
+            tonumber(state.settings.compass_size) or scaling.scale_f(112)
+        )
     );
     state.settings.compass_position_x = tonumber(state.settings.compass_position_x)
         or scaling.scale_w(80);
@@ -409,11 +471,66 @@ local function get_radar_entity(
     };
 end
 
+local function get_aggressive_monster(entity, index, zone_id, player_main_job_level)
+    local server_id = tonumber(entity:GetServerId(index)) or 0;
+    if server_id == 0 then
+        return nil;
+    end
+
+    local render_flags = tonumber(entity:GetRenderFlags0(index)) or 0;
+    if bit.band(render_flags, visible_render_flag) ~= visible_render_flag
+        or bit.band(render_flags, hidden_render_flag) ~= 0 then
+        return nil;
+    end
+    if (tonumber(entity:GetTrustOwnerTargetIndex(index)) or 0) ~= 0 then
+        return nil;
+    end
+
+    local spawn_flags = tonumber(entity:GetSpawnFlags(index)) or 0;
+    if bit.band(spawn_flags, monster_spawn_flag) == 0
+        or (tonumber(entity:GetHPPercent(index)) or 0) <= 0 then
+        return nil;
+    end
+
+    local distance_squared = tonumber(entity:GetDistance(index));
+    local aggressive_alert_range = state.settings.aggressive_alert_range;
+    local maximum_distance_squared = aggressive_alert_range * aggressive_alert_range;
+    if distance_squared == nil or distance_squared < 0
+        or distance_squared > maximum_distance_squared then
+        return nil;
+    end
+
+    local name = display_name(entity:GetName(index));
+    local monster_info = aggro_database.get_monster_info(zone_id, index, name);
+    if monster_info == nil or monster_info.Aggro ~= true then
+        return nil;
+    end
+
+    local maximum_monster_level = tonumber(monster_info.MaxLevel) or 0;
+    local level_gap = state.settings.aggressive_level_gap;
+    if state.settings.aggressive_level_filter_enabled
+        and player_main_job_level > 0
+        and maximum_monster_level > 0
+        and (player_main_job_level - maximum_monster_level) >= level_gap then
+        return nil;
+    end
+
+    return T{
+        id = server_id,
+        index = index,
+        name = name,
+        distance = math.sqrt(distance_squared),
+        maximum_level = maximum_monster_level,
+    };
+end
+
 local function scan_entities()
     local alert_scanning = state.settings.enabled and watched_name_count() > 0;
+    local aggressive_scanning = state.settings.enabled
+        and state.settings.aggressive_sound_enabled;
     local radar_scanning = state.settings.compass_enabled
         and state.settings.radar_enabled;
-    if not alert_scanning and not radar_scanning then
+    if not alert_scanning and not aggressive_scanning and not radar_scanning then
         clear_observation_state();
         return;
     end
@@ -429,6 +546,7 @@ local function scan_entities()
         or party:GetMemberServerId(0) == 0 then
         clear_observation_state();
         state.zone_id = nil;
+        aggro_database.reset();
         return;
     end
 
@@ -436,8 +554,8 @@ local function scan_entities()
     if state.zone_id ~= current_zone_id then
         clear_observation_state();
         state.zone_id = current_zone_id;
+        aggro_database.reset();
     end
-
     local entity = memory:GetEntity();
     if entity == nil then
         clear_observation_state();
@@ -449,10 +567,25 @@ local function scan_entities()
     local new_monsters = T{};
     local new_npcs = T{};
     local new_interactables = T{};
+    local aggressive_candidates = T{};
     local radar_candidates = T{};
     local pet_indices = T{};
     local maximum_distance_squared = state.settings.range * state.settings.range;
     local player_index = tonumber(party:GetMemberTargetIndex(0));
+    local player_main_job_level = tonumber(party:GetMemberMainJobLevel(0)) or 0;
+    state.player_main_job_level = player_main_job_level;
+    state.aggressive_suppressed_on_chocobo = false;
+    if aggressive_scanning and player_index ~= nil
+        and state.settings.aggressive_suppress_on_chocobo
+        and (tonumber(entity:GetStatusServer(player_index)) or 0) == chocobo_server_status then
+        aggressive_scanning = false;
+        state.aggressive_suppressed_on_chocobo = true;
+        state.aggressive_active_ids = T{};
+        state.aggressive_nearby_count = 0;
+    end
+    if aggressive_scanning then
+        aggro_database.load_zone(current_zone_id);
+    end
     local player_x = nil;
     local player_y = nil;
     if radar_scanning and player_index ~= nil then
@@ -464,14 +597,14 @@ local function scan_entities()
     end
 
     for index = 0, maximum_entity_index do
-        if radar_scanning then
+        if radar_scanning or aggressive_scanning then
             if (tonumber(entity:GetServerId(index)) or 0) ~= 0 then
                 local pet_index = tonumber(entity:GetPetTargetIndex(index)) or 0;
                 if pet_index ~= 0 then
                     pet_indices[pet_index] = true;
                 end
 
-                if index ~= player_index then
+                if radar_scanning and index ~= player_index then
                     local radar_entity = get_radar_entity(
                         entity,
                         index,
@@ -481,6 +614,17 @@ local function scan_entities()
                     );
                     if radar_entity ~= nil then
                         radar_candidates:append(radar_entity);
+                    end
+                end
+                if aggressive_scanning and index ~= player_index then
+                    local aggressive_monster = get_aggressive_monster(
+                        entity,
+                        index,
+                        current_zone_id,
+                        player_main_job_level
+                    );
+                    if aggressive_monster ~= nil then
+                        aggressive_candidates:append(aggressive_monster);
                     end
                 end
             end
@@ -514,6 +658,22 @@ local function scan_entities()
         return left.distance > right.distance;
     end);
 
+    local next_aggressive_ids = T{};
+    local next_aggressive_monsters = T{};
+    local new_aggressive_monsters = T{};
+    for _, aggressive_monster in ipairs(aggressive_candidates) do
+        if not pet_indices[aggressive_monster.index] then
+            next_aggressive_ids[aggressive_monster.id] = true;
+            next_aggressive_monsters:append(aggressive_monster);
+            if not state.aggressive_active_ids[aggressive_monster.id] then
+                new_aggressive_monsters:append(aggressive_monster);
+            end
+        end
+    end
+    next_aggressive_monsters:sort(function(left, right)
+        return left.distance < right.distance;
+    end);
+
     next_matches:sort(function(left, right)
         if left.distance == right.distance then
             return left.name < right.name;
@@ -522,6 +682,8 @@ local function scan_entities()
     end);
 
     state.active_ids = next_active_ids;
+    state.aggressive_active_ids = next_aggressive_ids;
+    state.aggressive_nearby_count = #next_aggressive_monsters;
     state.matches = next_matches;
     state.radar_entities = next_radar_entities;
 
@@ -542,6 +704,12 @@ local function scan_entities()
         notification_message(('Interactable %s detected at %.1f yalms.'):fmt(
             name,
             interactable.distance
+        ));
+    end
+    for _, aggressive_monster in ipairs(new_aggressive_monsters) do
+        notification_message(('Aggressive monster %s entered %.1f yalms.'):fmt(
+            aggressive_monster.name,
+            aggressive_monster.distance
         ));
     end
 
@@ -567,6 +735,18 @@ local function scan_entities()
             'interactable-object alert',
             state.settings.sound_volume_percent
         );
+    end
+    local aggressive_sound_now = tick_seconds();
+    if #new_aggressive_monsters > 0 and state.settings.aggressive_sound_enabled
+        and aggressive_sound_cooldown_remaining(aggressive_sound_now) <= 0 then
+        local played = play_alert_sound(
+            aggressive_sound_path,
+            'aggressive-monster warning',
+            state.settings.sound_volume_percent
+        );
+        if played and state.settings.sound_volume_percent > 0 then
+            state.last_aggressive_sound_at = aggressive_sound_now;
+        end
     end
 end
 
@@ -882,12 +1062,358 @@ local function draw_command_help()
     imgui.TextWrapped('/horizonscout show|hide - match overlay');
     imgui.TextWrapped('/horizonscout compass on|off - compass and radar');
     imgui.TextWrapped('/horizonscout sound|npcsound|objectsound on|off|test');
+    imgui.TextWrapped('/horizonscout aggrosound on|off|test - aggressive warning');
+    imgui.TextWrapped(('/horizonscout aggrorange <%d-%d> - aggressive warning range'):fmt(
+        minimum_aggressive_alert_range,
+        maximum_aggressive_alert_range
+    ));
+    imgui.TextWrapped(('/horizonscout aggrocooldown <0-%d> - sound cooldown in seconds'):fmt(
+        maximum_aggressive_sound_cooldown_seconds
+    ));
     imgui.TextWrapped(('/horizonscout range <%d-%d> - alert and radar range'):fmt(
         minimum_range,
         maximum_range
     ));
     imgui.TextWrapped('/horizonscout list - show current status in this window');
     imgui.TextDisabled('Short alias: /hs. Legacy /mobalert is also accepted.');
+end
+
+local function restart_aggressive_scan()
+    state.aggressive_active_ids = T{};
+    state.aggressive_nearby_count = 0;
+    state.last_scan_at = 0;
+end
+
+local function draw_sound_setting(
+    setting_key,
+    label,
+    button_id,
+    sound_path,
+    sound_label,
+    success_message,
+    muted_message,
+    failure_message
+)
+    local sound_enabled = {state.settings[setting_key]};
+    if imgui.Checkbox(label, sound_enabled) then
+        state.settings[setting_key] = sound_enabled[1];
+        settings.save();
+        state.last_scan_at = 0;
+    end
+    imgui.SameLine();
+    if imgui.SmallButton('Test##' .. button_id) then
+        if play_alert_sound(
+            sound_path,
+            sound_label,
+            state.settings.sound_volume_percent
+        ) then
+            settings_ui.feedback = state.settings.sound_volume_percent == 0
+                and muted_message
+                or success_message;
+        else
+            settings_ui.feedback = failure_message;
+        end
+    end
+end
+
+local function draw_main_settings_tab()
+    local enabled = {state.settings.enabled};
+    if imgui.Checkbox('Enable scanning', enabled) then
+        state.settings.enabled = enabled[1];
+        update_settings();
+        state.last_scan_at = 0;
+    end
+
+    local chat_notifications = {state.settings.chat_notifications_enabled};
+    if imgui.Checkbox('Print routine notices in chat', chat_notifications) then
+        state.settings.chat_notifications_enabled = chat_notifications[1];
+        settings.save();
+    end
+    imgui.SameLine();
+    imgui.TextDisabled('Off by default; errors remain visible');
+
+    local display_enabled = {state.settings.display_enabled};
+    if imgui.Checkbox('Show nearby-match overlay', display_enabled) then
+        state.settings.display_enabled = display_enabled[1];
+        settings.save();
+        update_display();
+    end
+
+    imgui.Text('Small UI scale');
+    imgui.SameLine();
+    imgui.SetNextItemWidth(190);
+    local overlay_scale = {math.floor(state.settings.overlay_scale_percent)};
+    if imgui.SliderInt(
+        '##HorizonScoutOverlayScale',
+        overlay_scale,
+        50,
+        200,
+        '%d%%',
+        ImGuiSliderFlags_AlwaysClamp
+    ) then
+        state.settings.overlay_scale_percent = overlay_scale[1];
+        settings.save();
+    end
+    imgui.SameLine();
+    if imgui.SmallButton('Reset##HorizonScoutOverlayScaleReset') then
+        state.settings.overlay_scale_percent = 100;
+        settings.save();
+    end
+
+    local position_enabled = {state.settings.position_enabled};
+    if imgui.Checkbox('Show map-grid position in overlay', position_enabled) then
+        state.settings.position_enabled = position_enabled[1];
+        settings.save();
+        update_display();
+    end
+    imgui.SameLine();
+    imgui.TextDisabled('Current: ' .. state.map_position);
+
+    local compass_enabled = {state.settings.compass_enabled};
+    if imgui.Checkbox('Show player-facing compass', compass_enabled) then
+        state.settings.compass_enabled = compass_enabled[1];
+        settings.save();
+    end
+
+    local compass_locked = {state.settings.compass_locked};
+    if imgui.Checkbox('Lock compass position', compass_locked) then
+        state.settings.compass_locked = compass_locked[1];
+        settings.save();
+    end
+
+    local radar_enabled = {state.settings.radar_enabled};
+    if imgui.Checkbox('Show nearby dots on compass', radar_enabled) then
+        state.settings.radar_enabled = radar_enabled[1];
+        settings.save();
+        state.last_scan_at = 0;
+    end
+    imgui.SameLine();
+    imgui.TextDisabled('Blue players | red monsters | green NPCs / objects');
+
+    imgui.Text('Heading correction');
+    imgui.SameLine();
+    imgui.SetNextItemWidth(190);
+    local heading_offset = {math.floor(state.settings.compass_heading_offset_degrees)};
+    if imgui.SliderInt(
+        '##HorizonScoutHeadingOffset',
+        heading_offset,
+        -180,
+        180,
+        '%d deg',
+        ImGuiSliderFlags_AlwaysClamp
+    ) then
+        state.settings.compass_heading_offset_degrees = heading_offset[1];
+        settings.save();
+    end
+    imgui.SameLine();
+    if imgui.SmallButton('Screenshot default##HorizonScoutHeadingReset') then
+        state.settings.compass_heading_offset_degrees = -90;
+        settings.save();
+    end
+
+    imgui.Text('Compass size');
+    imgui.SameLine();
+    imgui.SetNextItemWidth(190);
+    local compass_size = {math.floor(state.settings.compass_size)};
+    if imgui.SliderInt(
+        '##HorizonScoutCompassSize',
+        compass_size,
+        80,
+        maximum_compass_size,
+        '%d px',
+        ImGuiSliderFlags_AlwaysClamp
+    ) then
+        state.settings.compass_size = compass_size[1];
+        settings.save();
+    end
+    imgui.SameLine();
+    if imgui.SmallButton('Reset position##HorizonScoutCompassReset') then
+        state.settings.compass_position_x = scaling.scale_w(80);
+        state.settings.compass_position_y = scaling.scale_h(80);
+        compass.request_position_reset();
+        settings.save();
+    end
+
+    imgui.Text('Alert volume');
+    imgui.SameLine();
+    imgui.SetNextItemWidth(220);
+    local sound_volume = {math.floor(state.settings.sound_volume_percent)};
+    if imgui.SliderInt(
+        '##HorizonScoutSoundVolume',
+        sound_volume,
+        0,
+        150,
+        '%d%%',
+        ImGuiSliderFlags_AlwaysClamp
+    ) then
+        state.settings.sound_volume_percent = sound_volume[1];
+        settings.save();
+    end
+
+    imgui.Text('Tracked-name / radar range');
+    imgui.SameLine();
+    imgui.SetNextItemWidth(190);
+    local range = {math.floor(state.settings.range)};
+    if imgui.SliderInt(
+        '##HorizonScoutRange',
+        range,
+        minimum_range,
+        maximum_range,
+        '%d yalms',
+        ImGuiSliderFlags_AlwaysClamp
+    ) then
+        state.settings.range = range[1];
+        update_settings();
+        state.last_scan_at = 0;
+    end
+
+    imgui.Spacing();
+    local help_button_label = settings_ui.show_help
+        and 'Hide command help##HorizonScoutHelp'
+        or 'Show command help##HorizonScoutHelp';
+    if imgui.Button(help_button_label) then
+        settings_ui.show_help = not settings_ui.show_help;
+    end
+    draw_command_help();
+end
+
+local function draw_monsters_tab()
+    draw_sound_setting(
+        'sound_enabled',
+        'Play tracked-monster detection sound',
+        'HorizonScoutMonsterSoundTest',
+        monster_sound_path,
+        'monster alert',
+        'Played mobalert.wav at the configured volume.',
+        'Monster sound is muted at 0%.',
+        'The monster sound test failed; see chat.'
+    );
+    draw_sound_setting(
+        'aggressive_sound_enabled',
+        'Play aggressive-monster warning',
+        'HorizonScoutAggressiveSoundTest',
+        aggressive_sound_path,
+        'aggressive-monster warning',
+        'Played aggressivealert.wav at the configured volume.',
+        'Aggressive-monster warning is muted at 0%.',
+        'The aggressive-monster sound test failed; see chat.'
+    );
+
+    imgui.Text('Aggressive warning range');
+    imgui.SameLine();
+    imgui.SetNextItemWidth(90);
+    local aggressive_range = {math.floor(state.settings.aggressive_alert_range)};
+    if imgui.InputInt('##HorizonScoutAggressiveRange', aggressive_range, 1, 5) then
+        state.settings.aggressive_alert_range = math.max(
+            minimum_aggressive_alert_range,
+            math.min(maximum_aggressive_alert_range, aggressive_range[1])
+        );
+        settings.save();
+        restart_aggressive_scan();
+    end
+    imgui.SameLine();
+    imgui.Text('yalms');
+
+    imgui.Text('Aggressive sound cooldown');
+    imgui.SameLine();
+    imgui.SetNextItemWidth(90);
+    local aggressive_cooldown = {
+        math.floor(state.settings.aggressive_sound_cooldown_seconds)
+    };
+    if imgui.InputInt('##HorizonScoutAggressiveCooldown', aggressive_cooldown, 1, 5) then
+        state.settings.aggressive_sound_cooldown_seconds = math.max(
+            0,
+            math.min(
+                maximum_aggressive_sound_cooldown_seconds,
+                aggressive_cooldown[1]
+            )
+        );
+        settings.save();
+    end
+    imgui.SameLine();
+    imgui.Text('seconds');
+    imgui.TextDisabled('Automatic warning only; 0 disables the cooldown.');
+
+    local suppress_on_chocobo = {state.settings.aggressive_suppress_on_chocobo};
+    if imgui.Checkbox('Suppress aggressive warning while on a chocobo', suppress_on_chocobo) then
+        state.settings.aggressive_suppress_on_chocobo = suppress_on_chocobo[1];
+        settings.save();
+        restart_aggressive_scan();
+    end
+
+    local level_filter = {state.settings.aggressive_level_filter_enabled};
+    if imgui.Checkbox('Ignore aggressive monsters far below your level', level_filter) then
+        state.settings.aggressive_level_filter_enabled = level_filter[1];
+        settings.save();
+        restart_aggressive_scan();
+    end
+    imgui.Text('Ignore when at least');
+    imgui.SameLine();
+    imgui.SetNextItemWidth(70);
+    local level_gap = {math.floor(state.settings.aggressive_level_gap)};
+    if imgui.InputInt('##HorizonScoutAggressiveLevelGap', level_gap, 1, 5) then
+        state.settings.aggressive_level_gap = math.max(1, math.min(99, level_gap[1]));
+        settings.save();
+        restart_aggressive_scan();
+    end
+    imgui.SameLine();
+    imgui.Text('levels below your main job');
+    imgui.TextDisabled('Uses the monster maximum spawn level; unknown levels still alert.');
+
+    local aggression_status = state.aggressive_suppressed_on_chocobo
+        and 'suppressed on chocobo'
+        or ('nearby: %d'):fmt(state.aggressive_nearby_count);
+    imgui.TextDisabled(
+        ('Database: %s | main level: %d | %s'):fmt(
+            aggro_database.get_status(),
+            state.player_main_job_level,
+            aggression_status
+        )
+    );
+    local cooldown_remaining = aggressive_sound_cooldown_remaining(tick_seconds());
+    if cooldown_remaining > 0 then
+        imgui.TextDisabled(('Sound cooldown: %.1f seconds remaining'):fmt(cooldown_remaining));
+    else
+        imgui.TextDisabled('Sound cooldown: ready');
+    end
+
+    imgui.Spacing();
+    draw_name_editor('monster', 'Monster names', settings_ui.name_input, 'HorizonScoutMonster');
+end
+
+local function draw_npcs_tab()
+    draw_sound_setting(
+        'npc_sound_enabled',
+        'Play NPC detection sound',
+        'HorizonScoutNpcSoundTest',
+        npc_sound_path,
+        'NPC alert',
+        'Played npcalert.wav at the configured volume.',
+        'NPC sound is muted at 0%.',
+        'The NPC sound test failed; see chat.'
+    );
+    imgui.Spacing();
+    draw_name_editor('npc', 'NPC names', settings_ui.npc_name_input, 'HorizonScoutNpc');
+end
+
+local function draw_objects_tab()
+    draw_sound_setting(
+        'interactable_sound_enabled',
+        'Play interactable-object detection sound',
+        'HorizonScoutInteractableSoundTest',
+        interactable_sound_path,
+        'interactable-object alert',
+        'Played interactablealert.wav at the configured volume.',
+        'Interactable-object sound is muted at 0%.',
+        'The interactable-object sound test failed; see chat.'
+    );
+    imgui.Spacing();
+    draw_name_editor(
+        'interactable',
+        'Interactable object names',
+        settings_ui.interactable_name_input,
+        'HorizonScoutInteractable'
+    );
 end
 
 local function draw_settings_ui()
@@ -901,245 +1427,25 @@ local function draw_settings_ui()
         settings_ui.is_open,
         ImGuiWindowFlags_AlwaysAutoResize
     ) then
-        imgui.Text('Detection');
-        imgui.Separator();
-
-        local enabled = {state.settings.enabled};
-        if imgui.Checkbox('Enable scanning', enabled) then
-            state.settings.enabled = enabled[1];
-            update_settings();
-            state.last_scan_at = 0;
-        end
-
-        local chat_notifications = {state.settings.chat_notifications_enabled};
-        if imgui.Checkbox('Print routine notices in chat', chat_notifications) then
-            state.settings.chat_notifications_enabled = chat_notifications[1];
-            settings.save();
-        end
-        imgui.SameLine();
-        imgui.TextDisabled('Off by default; errors remain visible');
-
-        local display_enabled = {state.settings.display_enabled};
-        if imgui.Checkbox('Show nearby-match overlay', display_enabled) then
-            state.settings.display_enabled = display_enabled[1];
-            settings.save();
-            update_display();
-        end
-
-        imgui.Text('Small UI scale');
-        imgui.SameLine();
-        imgui.SetNextItemWidth(190);
-        local overlay_scale = {math.floor(state.settings.overlay_scale_percent)};
-        if imgui.SliderInt(
-            '##HorizonScoutOverlayScale',
-            overlay_scale,
-            50,
-            200,
-            '%d%%',
-            ImGuiSliderFlags_AlwaysClamp
-        ) then
-            state.settings.overlay_scale_percent = overlay_scale[1];
-            settings.save();
-        end
-        imgui.SameLine();
-        if imgui.SmallButton('Reset##HorizonScoutOverlayScaleReset') then
-            state.settings.overlay_scale_percent = 100;
-            settings.save();
-        end
-
-        local position_enabled = {state.settings.position_enabled};
-        if imgui.Checkbox('Show map-grid position in overlay', position_enabled) then
-            state.settings.position_enabled = position_enabled[1];
-            settings.save();
-            update_display();
-        end
-        imgui.SameLine();
-        imgui.TextDisabled('Current: ' .. state.map_position);
-
-        local compass_enabled = {state.settings.compass_enabled};
-        if imgui.Checkbox('Show player-facing compass', compass_enabled) then
-            state.settings.compass_enabled = compass_enabled[1];
-            settings.save();
-        end
-
-        local compass_locked = {state.settings.compass_locked};
-        if imgui.Checkbox('Lock compass position', compass_locked) then
-            state.settings.compass_locked = compass_locked[1];
-            settings.save();
-        end
-
-        local radar_enabled = {state.settings.radar_enabled};
-        if imgui.Checkbox('Show nearby dots on compass', radar_enabled) then
-            state.settings.radar_enabled = radar_enabled[1];
-            settings.save();
-            state.last_scan_at = 0;
-        end
-        imgui.SameLine();
-        imgui.TextDisabled('Blue players | red monsters | green NPCs / objects');
-
-        imgui.Text('Heading correction');
-        imgui.SameLine();
-        imgui.SetNextItemWidth(190);
-        local heading_offset = {
-            math.floor(state.settings.compass_heading_offset_degrees)
-        };
-        if imgui.SliderInt(
-            '##HorizonScoutHeadingOffset',
-            heading_offset,
-            -180,
-            180,
-            '%d deg',
-            ImGuiSliderFlags_AlwaysClamp
-        ) then
-            state.settings.compass_heading_offset_degrees = heading_offset[1];
-            settings.save();
-        end
-        imgui.SameLine();
-        if imgui.SmallButton('Screenshot default##HorizonScoutHeadingReset') then
-            state.settings.compass_heading_offset_degrees = -90;
-            settings.save();
-        end
-
-        imgui.Text('Compass size');
-        imgui.SameLine();
-        imgui.SetNextItemWidth(190);
-        local compass_size = {math.floor(state.settings.compass_size)};
-        if imgui.SliderInt(
-            '##HorizonScoutCompassSize',
-            compass_size,
-            80,
-            180,
-            '%d px',
-            ImGuiSliderFlags_AlwaysClamp
-        ) then
-            state.settings.compass_size = compass_size[1];
-            settings.save();
-        end
-        imgui.SameLine();
-        if imgui.SmallButton('Reset position##HorizonScoutCompassReset') then
-            state.settings.compass_position_x = scaling.scale_w(80);
-            state.settings.compass_position_y = scaling.scale_h(80);
-            compass.request_position_reset();
-            settings.save();
-        end
-
-        local sound_enabled = {state.settings.sound_enabled};
-        if imgui.Checkbox('Play monster detection sound', sound_enabled) then
-            state.settings.sound_enabled = sound_enabled[1];
-            settings.save();
-        end
-        imgui.SameLine();
-        if imgui.SmallButton('Test##HorizonScoutMonsterSoundTest') then
-            if play_alert_sound(
-                monster_sound_path,
-                'monster alert',
-                state.settings.sound_volume_percent
-            ) then
-                settings_ui.feedback = state.settings.sound_volume_percent == 0
-                    and 'Monster sound is muted at 0%.'
-                    or 'Played mobalert.wav at the configured volume.';
-            else
-                settings_ui.feedback = 'The monster sound test failed; see chat.';
+        if imgui.BeginTabBar('##HorizonScoutSettingsTabs') then
+            if imgui.BeginTabItem('Settings') then
+                draw_main_settings_tab();
+                imgui.EndTabItem();
             end
-        end
-
-        local npc_sound_enabled = {state.settings.npc_sound_enabled};
-        if imgui.Checkbox('Play NPC detection sound', npc_sound_enabled) then
-            state.settings.npc_sound_enabled = npc_sound_enabled[1];
-            settings.save();
-        end
-        imgui.SameLine();
-        if imgui.SmallButton('Test##HorizonScoutNpcSoundTest') then
-            if play_alert_sound(
-                npc_sound_path,
-                'NPC alert',
-                state.settings.sound_volume_percent
-            ) then
-                settings_ui.feedback = state.settings.sound_volume_percent == 0
-                    and 'NPC sound is muted at 0%.'
-                    or 'Played npcalert.wav at the configured volume.';
-            else
-                settings_ui.feedback = 'The NPC sound test failed; see chat.';
+            if imgui.BeginTabItem('Monsters') then
+                draw_monsters_tab();
+                imgui.EndTabItem();
             end
-        end
-
-        local interactable_sound_enabled = {state.settings.interactable_sound_enabled};
-        if imgui.Checkbox(
-            'Play interactable-object detection sound',
-            interactable_sound_enabled
-        ) then
-            state.settings.interactable_sound_enabled = interactable_sound_enabled[1];
-            settings.save();
-            state.last_scan_at = 0;
-        end
-        imgui.SameLine();
-        if imgui.SmallButton('Test##HorizonScoutInteractableSoundTest') then
-            if play_alert_sound(
-                interactable_sound_path,
-                'interactable-object alert',
-                state.settings.sound_volume_percent
-            ) then
-                settings_ui.feedback = state.settings.sound_volume_percent == 0
-                    and 'Interactable-object sound is muted at 0%.'
-                    or 'Played interactablealert.wav at the configured volume.';
-            else
-                settings_ui.feedback = 'The interactable-object sound test failed; see chat.';
+            if imgui.BeginTabItem("NPC's") then
+                draw_npcs_tab();
+                imgui.EndTabItem();
             end
+            if imgui.BeginTabItem('Objects') then
+                draw_objects_tab();
+                imgui.EndTabItem();
+            end
+            imgui.EndTabBar();
         end
-
-        imgui.Text('Alert volume');
-        imgui.SameLine();
-        imgui.SetNextItemWidth(220);
-        local sound_volume = {math.floor(state.settings.sound_volume_percent)};
-        if imgui.SliderInt(
-            '##HorizonScoutSoundVolume',
-            sound_volume,
-            0,
-            150,
-            '%d%%',
-            ImGuiSliderFlags_AlwaysClamp
-        ) then
-            state.settings.sound_volume_percent = sound_volume[1];
-            settings.save();
-        end
-
-        imgui.Text('Detection range');
-        imgui.SameLine();
-        imgui.SetNextItemWidth(220);
-        local range = {math.floor(state.settings.range)};
-        if imgui.SliderInt(
-            '##HorizonScoutRange',
-            range,
-            minimum_range,
-            maximum_range,
-            '%d yalms',
-            ImGuiSliderFlags_AlwaysClamp
-        ) then
-            state.settings.range = range[1];
-            update_settings();
-            state.last_scan_at = 0;
-        end
-
-        imgui.Spacing();
-        draw_name_editor('monster', 'Monster names', settings_ui.name_input, 'HorizonScoutMonster');
-        imgui.Spacing();
-        draw_name_editor('npc', 'NPC names', settings_ui.npc_name_input, 'HorizonScoutNpc');
-        imgui.Spacing();
-        draw_name_editor(
-            'interactable',
-            'Interactable object names',
-            settings_ui.interactable_name_input,
-            'HorizonScoutInteractable'
-        );
-
-        imgui.Spacing();
-        local help_button_label = settings_ui.show_help
-            and 'Hide command help##HorizonScoutHelp'
-            or 'Show command help##HorizonScoutHelp';
-        if imgui.Button(help_button_label) then
-            settings_ui.show_help = not settings_ui.show_help;
-        end
-        draw_command_help();
 
         imgui.Spacing();
         imgui.Separator();
@@ -1188,6 +1494,11 @@ ashita.events.register('load', 'HorizonScout_Load', function()
     if not sound_file_exists(interactable_sound_path) then
         error_message(
             'interactablealert.wav is missing; object alerts will remain visible on the radar.'
+        );
+    end
+    if not sound_file_exists(aggressive_sound_path) then
+        error_message(
+            'aggressivealert.wav is missing; aggressive-monster warnings are disabled.'
         );
     end
     notification_message(
@@ -1413,6 +1724,63 @@ ashita.events.register('command', 'HorizonScout_Command', function(e)
         end
     end
 
+    if (command == 'aggrosound' or command == 'aggressivesound') and #args == 3 then
+        local option = args[3]:lower();
+        if option == 'test' then
+            if play_alert_sound(
+                aggressive_sound_path,
+                'aggressive-monster warning',
+                state.settings.sound_volume_percent
+            ) then
+                notification_message('Played the aggressive-monster warning sound.');
+            end
+            return;
+        end
+        if option == 'on' or option == 'off' then
+            state.settings.aggressive_sound_enabled = option == 'on';
+            settings.save();
+            state.last_scan_at = 0;
+            notification_message(
+                state.settings.aggressive_sound_enabled
+                    and 'Aggressive-monster warnings enabled.'
+                    or 'Aggressive-monster warnings disabled.'
+            );
+            return;
+        end
+    end
+
+    if (command == 'aggrorange' or command == 'aggressiverange') and #args == 3 then
+        local requested = tonumber(args[3]);
+        if requested == nil or requested < minimum_aggressive_alert_range
+            or requested > maximum_aggressive_alert_range then
+            error_message(('Aggressive warning range must be between %d and %d yalms.'):fmt(
+                minimum_aggressive_alert_range,
+                maximum_aggressive_alert_range
+            ));
+            return;
+        end
+        state.settings.aggressive_alert_range = requested;
+        settings.save();
+        restart_aggressive_scan();
+        notification_message(('Aggressive warning range set to %.0f yalms.'):fmt(requested));
+        return;
+    end
+
+    if (command == 'aggrocooldown' or command == 'aggressivecooldown') and #args == 3 then
+        local requested = tonumber(args[3]);
+        if requested == nil or requested < 0
+            or requested > maximum_aggressive_sound_cooldown_seconds then
+            error_message(('Aggressive sound cooldown must be between 0 and %d seconds.'):fmt(
+                maximum_aggressive_sound_cooldown_seconds
+            ));
+            return;
+        end
+        state.settings.aggressive_sound_cooldown_seconds = requested;
+        settings.save();
+        notification_message(('Aggressive sound cooldown set to %.0f seconds.'):fmt(requested));
+        return;
+    end
+
     if command == 'range' and #args == 3 then
         local requested = tonumber(args[3]);
         if requested == nil or requested < minimum_range or requested > maximum_range then
@@ -1452,6 +1820,7 @@ end);
 
 ashita.events.register('unload', 'HorizonScout_Unload', function()
     sound_player.shutdown();
+    aggro_database.reset();
     settings.save();
     map_grid.reset();
     settings_ui.is_open[1] = false;
