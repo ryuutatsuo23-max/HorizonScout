@@ -19,6 +19,55 @@ zone.
 > HorizonScout is a custom addon. Check the current HorizonXI addon rules before
 > using it on the live server.
 
+## Preview
+
+Real in-game screenshots showing the nearby tracker, compass radar, and settings.
+These show an example configuration, not the default values listed below.
+
+<table>
+  <tr>
+    <th>Nearby tracker</th>
+    <th>Compass radar</th>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/images/horizonscout-tracker.png" alt="HorizonScout tracking NPC Abelard, with map position, distance, Target and Remove buttons" width="594"></td>
+    <td valign="top"><img src="docs/images/horizonscout-radar.png" alt="Player-facing compass radar with blue player dots, red monster dots, and green NPC or object dots" width="215"></td>
+  </tr>
+</table>
+
+Blue dots are players, red dots are monsters, and green dots are NPCs or objects.
+`Target` selects a detected entity without interacting with it.
+
+<details>
+<summary>View the four settings tabs</summary>
+
+### Settings
+
+Shared scanning, display, compass, volume, and tracking-range controls.
+
+![HorizonScout Settings tab with display scale, compass size and alert volume controls](docs/images/horizonscout-settings.png)
+
+### Monsters
+
+Tracked-monster sound, aggressive warning range and cooldown, chocobo suppression,
+and level filtering. The database status here shows `Ready: MobDB`.
+
+![HorizonScout Monsters tab with aggressive warning settings and a ready MobDB database](docs/images/horizonscout-monsters.png)
+
+### NPC's
+
+Exact-name NPC tracking and its separate sound control.
+
+![HorizonScout NPC tab with Abelard configured for tracking](docs/images/horizonscout-npcs.png)
+
+### Objects
+
+Exact-name object tracking and its separate sound control.
+
+![HorizonScout Objects tab with Stone Monument configured for tracking](docs/images/horizonscout-objects.png)
+
+</details>
+
 ## Requirements
 
 - Final Fantasy XI running through Ashita v4.
